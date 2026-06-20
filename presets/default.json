@@ -1,0 +1,115 @@
+{
+  "presets": [
+    {
+      "id": "web-gallery",
+      "name": "Web gallery",
+      "description": "Max 2000px wide, JPEG q85, strip EXIF, target <500KB",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": true,
+        "convert_enabled": true,
+        "strip_exif": true,
+        "compress_mode": "target_size",
+        "target_size_kb": 500,
+        "quality": 85,
+        "lossless_first": false,
+        "max_width": 2000,
+        "output_format": "JPEG"
+      }
+    },
+    {
+      "id": "email-upload",
+      "name": "Email / upload limit",
+      "description": "Target 12MB max, lossless jpegtran first",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": false,
+        "convert_enabled": false,
+        "strip_exif": true,
+        "compress_mode": "target_size",
+        "target_size_mb": 12,
+        "lossless_first": true,
+        "output_format": "keep"
+      }
+    },
+    {
+      "id": "social-og",
+      "name": "Social / OG",
+      "description": "1200×630 cover crop, JPEG q88, <300KB",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": true,
+        "convert_enabled": true,
+        "strip_exif": true,
+        "compress_mode": "target_size",
+        "target_size_kb": 300,
+        "quality": 88,
+        "exact_width": 1200,
+        "exact_height": 630,
+        "fit_mode": "cover",
+        "output_format": "JPEG"
+      }
+    },
+    {
+      "id": "print-quality",
+      "name": "Print keep quality",
+      "description": "No resize, JPEG q95, subsampling 0, keep ICC",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": false,
+        "convert_enabled": false,
+        "strip_exif": false,
+        "keep_icc": true,
+        "compress_mode": "quality",
+        "quality": 95,
+        "subsampling": 0,
+        "output_format": "keep"
+      }
+    },
+    {
+      "id": "png-to-jpg",
+      "name": "PNG → JPG web",
+      "description": "Convert, white bg, q85, strip alpha",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": false,
+        "convert_enabled": true,
+        "strip_exif": true,
+        "compress_mode": "quality",
+        "quality": 85,
+        "output_format": "JPEG",
+        "bg_color": "#ffffff"
+      }
+    },
+    {
+      "id": "thumbnail-batch",
+      "name": "Thumbnail batch",
+      "description": "400px max edge, WEBP q80",
+      "settings": {
+        "compress_enabled": true,
+        "resize_enabled": true,
+        "convert_enabled": true,
+        "strip_exif": true,
+        "compress_mode": "quality",
+        "webp_quality": 80,
+        "max_width": 400,
+        "max_height": 400,
+        "output_format": "WEBP"
+      }
+    },
+    {
+      "id": "upscale-2x",
+      "name": "Upscale 2×",
+      "description": "Lanczos 2× (standard interpolation, not AI)",
+      "settings": {
+        "compress_enabled": false,
+        "resize_enabled": false,
+        "upscale_enabled": true,
+        "convert_enabled": false,
+        "upscale_factor": 2,
+        "upscale_method": "standard",
+        "output_format": "keep"
+      }
+    }
+  ]
+}
