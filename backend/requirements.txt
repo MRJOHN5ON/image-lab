@@ -1,6 +1,5 @@
-fastapi
-uvicorn[standard]
-python-multipart
-Pillow
-pillow-heif
-aiofiles
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+Pillow>=11.3
+pillow-heif>=0.18

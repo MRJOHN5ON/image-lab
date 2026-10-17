@@ -1,114 +1,155 @@
 {
   "presets": [
     {
-      "id": "web-gallery",
-      "name": "Web gallery",
-      "description": "Max 2000px wide, JPEG q85, strip EXIF, target <500KB",
+      "id": "lossless",
+      "name": "Lossless optimise",
+      "description": "Same pixels, smaller file. Strips metadata, keeps colour profile.",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": true,
-        "convert_enabled": true,
-        "strip_exif": true,
+        "compress_mode": "lossless",
+        "strip_metadata": true,
+        "keep_icc": true,
+        "output_format": "keep"
+      }
+    },
+    {
+      "id": "web-gallery",
+      "name": "Web gallery",
+      "description": "Max 2000 px wide, JPEG under 500 KB",
+      "settings": {
+        "compress_enabled": true,
         "compress_mode": "target_size",
-        "target_size_kb": 500,
+        "target_size": 500,
+        "target_unit": "KB",
         "quality": 85,
-        "lossless_first": false,
+        "resize_enabled": true,
+        "resize_mode": "fit",
         "max_width": 2000,
-        "output_format": "JPEG"
+        "output_format": "JPEG",
+        "strip_metadata": true
+      }
+    },
+    {
+      "id": "modern-web",
+      "name": "Modern web (WebP)",
+      "description": "Max 2560 px, WebP quality 80",
+      "settings": {
+        "compress_enabled": true,
+        "compress_mode": "quality",
+        "quality": 80,
+        "resize_enabled": true,
+        "resize_mode": "fit",
+        "max_width": 2560,
+        "max_height": 2560,
+        "output_format": "WEBP",
+        "strip_metadata": true
+      }
+    },
+    {
+      "id": "avif-small",
+      "name": "Smallest (AVIF)",
+      "description": "Max 2560 px, AVIF quality 60 — best compression, slower",
+      "settings": {
+        "compress_enabled": true,
+        "compress_mode": "quality",
+        "quality": 60,
+        "resize_enabled": true,
+        "resize_mode": "fit",
+        "max_width": 2560,
+        "max_height": 2560,
+        "output_format": "AVIF",
+        "strip_metadata": true
       }
     },
     {
       "id": "email-upload",
       "name": "Email / upload limit",
-      "description": "Target 12MB max, lossless jpegtran first",
+      "description": "Every file under 12 MB, lossless when possible",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": false,
-        "convert_enabled": false,
-        "strip_exif": true,
         "compress_mode": "target_size",
-        "target_size_mb": 12,
-        "lossless_first": true,
-        "output_format": "keep"
+        "target_size": 12,
+        "target_unit": "MB",
+        "quality": 95,
+        "output_format": "keep",
+        "strip_metadata": true
       }
     },
     {
       "id": "social-og",
-      "name": "Social / OG",
-      "description": "1200×630 cover crop, JPEG q88, <300KB",
+      "name": "Social / OG image",
+      "description": "1200×630 cover crop, JPEG under 300 KB",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": true,
-        "convert_enabled": true,
-        "strip_exif": true,
         "compress_mode": "target_size",
-        "target_size_kb": 300,
+        "target_size": 300,
+        "target_unit": "KB",
         "quality": 88,
+        "resize_enabled": true,
+        "resize_mode": "exact",
         "exact_width": 1200,
         "exact_height": 630,
         "fit_mode": "cover",
-        "output_format": "JPEG"
+        "output_format": "JPEG",
+        "strip_metadata": true
       }
     },
     {
       "id": "print-quality",
-      "name": "Print keep quality",
-      "description": "No resize, JPEG q95, subsampling 0, keep ICC",
+      "name": "Print quality",
+      "description": "No resize, JPEG quality 95, 4:4:4, keeps all metadata",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": false,
-        "convert_enabled": false,
-        "strip_exif": false,
-        "keep_icc": true,
         "compress_mode": "quality",
         "quality": 95,
         "subsampling": 0,
+        "strip_metadata": false,
+        "keep_icc": true,
         "output_format": "keep"
       }
     },
     {
       "id": "png-to-jpg",
-      "name": "PNG → JPG web",
-      "description": "Convert, white bg, q85, strip alpha",
+      "name": "PNG → JPG",
+      "description": "Convert to JPEG quality 85, transparency on white",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": false,
-        "convert_enabled": true,
-        "strip_exif": true,
         "compress_mode": "quality",
         "quality": 85,
         "output_format": "JPEG",
-        "bg_color": "#ffffff"
+        "bg_color": "#ffffff",
+        "strip_metadata": true
       }
     },
     {
-      "id": "thumbnail-batch",
-      "name": "Thumbnail batch",
-      "description": "400px max edge, WEBP q80",
+      "id": "thumbnails",
+      "name": "Thumbnails",
+      "description": "Fit in 400×400, WebP quality 80",
       "settings": {
         "compress_enabled": true,
-        "resize_enabled": true,
-        "convert_enabled": true,
-        "strip_exif": true,
         "compress_mode": "quality",
-        "webp_quality": 80,
+        "quality": 80,
+        "resize_enabled": true,
+        "resize_mode": "fit",
         "max_width": 400,
         "max_height": 400,
-        "output_format": "WEBP"
+        "output_format": "WEBP",
+        "strip_metadata": true,
+        "naming_suffix": "_thumb"
       }
     },
     {
       "id": "upscale-2x",
       "name": "Upscale 2×",
-      "description": "Lanczos 2× (standard interpolation, not AI)",
+      "description": "Lanczos 2× (interpolation, not AI)",
       "settings": {
-        "compress_enabled": false,
-        "resize_enabled": false,
+        "compress_enabled": true,
+        "compress_mode": "quality",
+        "quality": 92,
         "upscale_enabled": true,
-        "convert_enabled": false,
         "upscale_factor": 2,
-        "upscale_method": "standard",
-        "output_format": "keep"
+        "output_format": "keep",
+        "naming_suffix": "_2x"
       }
     }
   ]

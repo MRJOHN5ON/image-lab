@@ -1,664 +1,823 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  addPaths,
-  cancelProcess,
-  clearQueue,
-  fetchHealth,
-  fetchPresets,
-  fetchProcessStatus,
-  fetchQueue,
-  formatBytes,
-  previewImage,
-  savePreset,
-  startProcess,
-  uploadFiles,
-} from './api'
+import { api, uploadFiles, urls } from './api'
+import ActionBar from './components/ActionBar'
+import { useFeedback } from './components/Feedback'
+import Icon from './components/Icon'
+import PreviewPanel from './components/PreviewPanel'
+import QueuePanel, { filterItems } from './components/QueuePanel'
+import SettingsPanel from './components/SettingsPanel'
+import TopBar from './components/TopBar'
+import { downloadBlob, downloadUrl, filesFromDrop, isDesktopApp, nativeDropPaths, onBridgeReady, pickPaths } from './native'
 import {
   DEFAULT_SETTINGS,
-  exportSettings,
-  importSettings,
-  loadSettingsFromStorage,
-  saveSettingsToStorage,
+  applyPreset,
+  exportSettingsFile,
+  loadSettings,
+  presetMatches,
+  readSettingsFile,
+  saveSettings,
 } from './settings'
-import './App.css'
+import { ACCEPTED_EXTENSIONS, isAcceptedFile, plural } from './utils/format'
 
-function StatusBadge({ status }) {
-  const colors = {
-    pending: '#8b95a8',
-    processing: '#4da3ff',
-    done: '#3dd68c',
-    failed: '#ff5c5c',
-    skipped: '#f5a623',
-    cancelled: '#8b95a8',
-  }
-  return (
-    <span className="status-badge" style={{ color: colors[status] || colors.pending }}>
-      {status}
-    </span>
-  )
+const THEME_KEY = 'image-lab-theme'
+const PRESET_KEY = 'image-lab-active-preset'
+
+const FIELD_INPUT_IDS = {
+  target_size: 'target-size',
+  quality: 'quality',
+  max_width: 'max-w',
+  max_height: 'max-h',
+  exact_width: 'ex-w',
+  exact_height: 'ex-h',
+  scale_percent: 'scale',
+  output_dir: 'out-dir',
+  naming_prefix: 'prefix',
+  naming_suffix: 'suffix',
+  bg_color: 'bg-color',
+  png_colors: 'png-colors',
 }
 
+const SHORTCUTS = [
+  ['⌘O', 'Add images'],
+  ['⇧⌘O', 'Add a folder'],
+  ['⌘V', 'Paste an image'],
+  ['⌘↩', 'Process the queue'],
+  ['Esc', 'Cancel processing'],
+  ['↑ ↓', 'Select previous / next image'],
+  ['⌫', 'Remove selected image'],
+  ['Space (hold)', 'Show the original'],
+  ['0 · 1 · 2', 'Zoom: fit · 100% · 200%'],
+]
+
+function useTheme() {
+  const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || 'system')
+  useEffect(() => {
+    localStorage.setItem(THEME_KEY, theme)
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const apply = () => {
+      document.documentElement.dataset.theme = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
+    }
+    apply()
+    media.addEventListener('change', apply)
+    return () => media.removeEventListener('change', apply)
+  }, [theme])
+  return [theme, setTheme]
+}
+
+const isTyping = (el) => Boolean(el?.closest?.('input, textarea, select, [contenteditable="true"]'))
+const isControl = (el) => Boolean(el?.closest?.('button, [role="radio"], [role="slider"], a'))
+const basename = (path) => (path || '').split('/').pop()
+
 export default function App() {
+  const { toast, confirm, prompt } = useFeedback()
+  const [theme, setTheme] = useTheme()
+  const [isApp, setIsApp] = useState(isDesktopApp)
   const [health, setHealth] = useState(null)
-  const [queue, setQueue] = useState({ items: [], count: 0, total_size: 0 })
-  const [settings, setSettings] = useState(loadSettingsFromStorage)
+  const [engineDown, setEngineDown] = useState(false)
+  const [items, setItems] = useState([])
+  const [settings, setSettings] = useState(loadSettings)
   const [presets, setPresets] = useState([])
+  const [activePresetId, setActivePresetId] = useState(() => localStorage.getItem(PRESET_KEY))
   const [selectedId, setSelectedId] = useState(null)
-  const [progress, setProgress] = useState(null)
-  const [preview, setPreview] = useState(null)
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [toast, setToast] = useState(null)
-  const [showTip, setShowTip] = useState(() => !localStorage.getItem('tip-dismissed'))
-  const [dragOver, setDragOver] = useState(false)
-  const [presetOpen, setPresetOpen] = useState(false)
-  const fileInputRef = useRef(null)
-  const pollRef = useRef(null)
+  const [filter, setFilter] = useState('all')
+  const [status, setStatus] = useState(null)
+  const [showSummary, setShowSummary] = useState(false)
+  const [preview, setPreview] = useState({ status: 'idle', data: null, error: null, itemId: null })
+  const [previewNonce, setPreviewNonce] = useState(0)
+  const [upload, setUpload] = useState(null)
+  const [dragging, setDragging] = useState(false)
+  const [holdOriginal, setHoldOriginal] = useState(false)
+  const [settingsError, setSettingsError] = useState(null)
+
+  const fileInput = useRef(null)
+  const folderInput = useRef(null)
+  const importInput = useRef(null)
+  const versionRef = useRef(-1)
+  const previewRun = useRef(0)
+  const actions = useRef({})
+
+  useEffect(() => onBridgeReady(() => setIsApp(true)), [])
 
   const refreshQueue = useCallback(async () => {
-    const data = await fetchQueue()
-    setQueue(data)
+    const q = await api.queue()
+    versionRef.current = q.version
+    setItems(q.items)
+    return q
+  }, [])
+
+  const loadPresets = useCallback(async () => {
+    try {
+      const data = await api.presets()
+      setPresets(data.presets || [])
+    } catch {
+      /* presets are optional */
+    }
+  }, [])
+
+  // ── boot (retries until the engine answers) ──────────────────────────
+  useEffect(() => {
+    let cancelled = false
+    let timer
+    const boot = async (attempt = 0) => {
+      try {
+        const [h, , st] = await Promise.all([api.health(), refreshQueue(), api.status()])
+        if (cancelled) return
+        setHealth(h)
+        setStatus(st)
+        setEngineDown(false)
+        loadPresets()
+      } catch {
+        if (cancelled) return
+        setEngineDown(true)
+        timer = setTimeout(() => boot(attempt + 1), Math.min(4000, 400 * (attempt + 1)))
+      }
+    }
+    boot()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [refreshQueue, loadPresets])
+
+  // ── settings persistence & preset tracking ───────────────────────────
+  useEffect(() => saveSettings(settings), [settings])
+
+  useEffect(() => {
+    if (activePresetId) localStorage.setItem(PRESET_KEY, activePresetId)
+    else localStorage.removeItem(PRESET_KEY)
+  }, [activePresetId])
+
+  useEffect(() => {
+    if (!activePresetId || !presets.length) return
+    const preset = presets.find((p) => p.id === activePresetId)
+    if (!preset || !presetMatches(preset, settings)) setActivePresetId(null)
+  }, [settings, presets, activePresetId])
+
+  const update = useCallback((key, value) => {
+    setSettings((s) => ({ ...s, [key]: value }))
+    setSettingsError((e) => (e?.field === key ? null : e))
+  }, [])
+
+  // ── selection ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!items.length) {
+      if (selectedId) setSelectedId(null)
+      return
+    }
+    if (!selectedId || !items.some((i) => i.id === selectedId)) setSelectedId(items[0].id)
+  }, [items, selectedId])
+
+  const selected = items.find((i) => i.id === selectedId) || null
+
+  // ── batch polling ────────────────────────────────────────────────────
+  const running = Boolean(status?.running)
+
+  const onBatchFinished = useRef(() => {})
+  onBatchFinished.current = (st) => {
+    setShowSummary(true)
+    if (!st.total) return
+    if (st.failed) {
+      toast(`${plural(st.failed, 'image')} failed`, {
+        type: 'error',
+        detail: `${st.done} processed. Select a failed image to see why.`,
+        action: { label: 'Show', onClick: () => setFilter('failed') },
+      })
+    } else if (!st.cancelled) {
+      toast(`Processed ${plural(st.done + st.skipped, 'image')}`, { type: 'success' })
+    }
+  }
+
+  useEffect(() => {
+    if (!running) return undefined
+    let stopped = false
+    let timer
+    const tick = async () => {
+      try {
+        const st = await api.status()
+        if (stopped) return
+        setStatus(st)
+        if (st.version !== versionRef.current) await refreshQueue()
+        if (!st.running) {
+          onBatchFinished.current(st)
+          return
+        }
+      } catch {
+        /* transient: keep polling */
+      }
+      if (!stopped) timer = setTimeout(tick, 400)
+    }
+    timer = setTimeout(tick, 200)
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+  }, [running, refreshQueue])
+
+  useEffect(() => {
+    document.title = running && status.total ? `${Math.round((status.completed / status.total) * 100)}% · Image Lab` : 'Image Lab'
+  }, [running, status])
+
+  // ── live preview ─────────────────────────────────────────────────────
+  const previewKey = selected ? `${selected.id}|${JSON.stringify(settings)}` : null
+  useEffect(() => {
+    if (!previewKey) return undefined
+    const id = previewKey.slice(0, previewKey.indexOf('|'))
+    const body = JSON.parse(previewKey.slice(previewKey.indexOf('|') + 1))
+    const controller = new AbortController()
+    const run = ++previewRun.current
+    setPreview((p) => ({ ...p, status: 'loading', itemId: id }))
+    const timer = setTimeout(async () => {
+      try {
+        const data = await api.preview(id, body, controller.signal)
+        if (run !== previewRun.current) return
+        setPreview({ status: 'ready', data, error: null, itemId: id })
+        setSettingsError(null)
+      } catch (e) {
+        if (e.name === 'AbortError' || run !== previewRun.current) return
+        const error = { message: e.message, field: e.field || null }
+        setPreview((p) => ({ status: 'error', data: p.data, error, itemId: id }))
+        if (e.field) setSettingsError(error)
+      }
+    }, 260)
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [previewKey, previewNonce])
+
+  // ── adding images ────────────────────────────────────────────────────
+  const reportAdded = useCallback(
+    (result, unsupported = 0) => {
+      const added = result.added?.length || 0
+      const rejected = result.rejected || []
+      const notes = []
+      if (result.duplicates) notes.push(`${result.duplicates} already in the queue`)
+      if (rejected.length + unsupported) notes.push(`${rejected.length + unsupported} skipped`)
+      if (added) {
+        toast(`Added ${plural(added, 'image')}`, { type: 'success', detail: notes.join(' · ') || undefined })
+        setFilter('all')
+        setSelectedId(result.added[0].id)
+      } else {
+        const why = rejected
+          .slice(0, 3)
+          .map((r) => `${r.name}: ${r.reason}`)
+          .join('\n')
+        toast(result.duplicates ? 'Those images are already in the queue' : 'No images were added', {
+          type: rejected.length ? 'error' : 'info',
+          detail: why || notes.join(' · ') || undefined,
+        })
+      }
+    },
+    [toast],
+  )
+
+  const addFiles = useCallback(
+    async (fileList) => {
+      const all = [...fileList]
+      const files = all.filter((f) => isAcceptedFile(f.name))
+      const unsupported = all.length - files.length
+      if (!files.length) {
+        if (all.length) toast('None of those files are supported images', { type: 'error', detail: ACCEPTED_EXTENSIONS.join(' ') })
+        return
+      }
+      if (
+        files.length > 1000 &&
+        !(await confirm({
+          title: `Add ${files.length.toLocaleString()} images?`,
+          message: 'Large drops are copied into Image Lab first. Adding the folder instead processes them in place.',
+          confirmLabel: 'Add them',
+        }))
+      ) {
+        return
+      }
+      const total = files.reduce((sum, f) => sum + f.size, 0)
+      setUpload({ loaded: 0, total, count: files.length })
+      try {
+        const result = await uploadFiles(files, (loaded) => setUpload({ loaded, total, count: files.length }))
+        await refreshQueue()
+        reportAdded(result, unsupported)
+      } catch (e) {
+        toast("Couldn't add images", { type: 'error', detail: e.message })
+        refreshQueue().catch(() => {})
+      } finally {
+        setUpload(null)
+      }
+    },
+    [confirm, refreshQueue, reportAdded, toast],
+  )
+
+  const addPaths = useCallback(
+    async (paths) => {
+      if (!paths?.length) return
+      setUpload({ loaded: 0, total: 1, count: paths.length })
+      try {
+        const result = await api.addPaths(paths)
+        await refreshQueue()
+        reportAdded(result)
+      } catch (e) {
+        toast("Couldn't add those files", { type: 'error', detail: e.message })
+      } finally {
+        setUpload(null)
+      }
+    },
+    [refreshQueue, reportAdded, toast],
+  )
+
+  const onAddFiles = useCallback(async () => {
+    if (isApp) {
+      try {
+        const paths = await pickPaths('files', health)
+        if (paths?.length) await addPaths(paths)
+        return
+      } catch (e) {
+        toast("Couldn't open the file picker", { type: 'error', detail: e.message })
+      }
+    }
+    fileInput.current?.click()
+  }, [isApp, health, addPaths, toast])
+
+  const onAddFolder = useCallback(async () => {
+    try {
+      const paths = await pickPaths('folder', health)
+      if (paths === null) folderInput.current?.click()
+      else if (paths.length) await addPaths(paths)
+    } catch (e) {
+      toast("Couldn't open the folder picker", { type: 'error', detail: e.message })
+      folderInput.current?.click()
+    }
+  }, [health, addPaths, toast])
+
+  // ── processing ───────────────────────────────────────────────────────
+  const focusField = useCallback((field) => {
+    setTimeout(() => {
+      const el = document.getElementById(FIELD_INPUT_IDS[field])
+      el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      el?.focus()
+    }, 60)
+  }, [])
+
+  const process = useCallback(
+    async (ids) => {
+      if (running || !items.length) return
+      const count = ids?.length || items.length
+      if (
+        settings.replace_originals &&
+        !(await confirm({
+          title: 'Replace original files?',
+          message: `${plural(count, 'original')} will be overwritten with the processed version. This can't be undone.`,
+          confirmLabel: 'Replace originals',
+          danger: true,
+        }))
+      ) {
+        return
+      }
+      try {
+        const result = await api.process(settings, ids)
+        setShowSummary(false)
+        setSettingsError(null)
+        setStatus(result.progress)
+        await refreshQueue()
+      } catch (e) {
+        if (e.field) {
+          setSettingsError({ field: e.field, message: e.message })
+          focusField(e.field)
+          toast('Check your settings', { type: 'error', detail: e.message })
+        } else {
+          toast("Couldn't start processing", { type: 'error', detail: e.message })
+        }
+      }
+    },
+    [running, items.length, settings, confirm, refreshQueue, focusField, toast],
+  )
+
+  const cancel = useCallback(async () => {
+    try {
+      const result = await api.cancel()
+      setStatus(result.progress)
+    } catch (e) {
+      toast("Couldn't cancel", { type: 'error', detail: e.message })
+    }
+  }, [toast])
+
+  const retryFailed = useCallback(() => {
+    const ids = items.filter((i) => i.status === 'failed').map((i) => i.id)
+    if (ids.length) process(ids)
+  }, [items, process])
+
+  // ── queue actions ────────────────────────────────────────────────────
+  const removeItem = useCallback(
+    async (id) => {
+      const visible = filterItems(items, filter)
+      const index = visible.findIndex((i) => i.id === id)
+      try {
+        await api.remove([id])
+        if (id === selectedId) setSelectedId(visible[index + 1]?.id || visible[index - 1]?.id || null)
+        await refreshQueue()
+      } catch (e) {
+        toast("Couldn't remove image", { type: 'error', detail: e.message })
+      }
+    },
+    [items, filter, selectedId, refreshQueue, toast],
+  )
+
+  const clearQueue = useCallback(
+    async (scope) => {
+      if (
+        scope === 'all' &&
+        !(await confirm({
+          title: `Clear ${plural(items.length, 'image')}?`,
+          message: 'They are removed from the queue only. Files on disk are not touched.',
+          confirmLabel: 'Clear queue',
+        }))
+      ) {
+        return
+      }
+      try {
+        const result = await api.clear(scope)
+        await refreshQueue()
+        if (scope === 'all') {
+          setPreview({ status: 'idle', data: null, error: null, itemId: null })
+          setShowSummary(false)
+        }
+        if (scope === 'finished') toast(`Removed ${plural(result.removed, 'finished image')}`)
+      } catch (e) {
+        toast("Couldn't clear the queue", { type: 'error', detail: e.message })
+      }
+    },
+    [items.length, confirm, refreshQueue, toast],
+  )
+
+  const reveal = useCallback(
+    async (path) => {
+      try {
+        await api.reveal(path)
+      } catch (e) {
+        toast("Couldn't show that in Finder", { type: 'error', detail: e.message })
+      }
+    },
+    [toast],
+  )
+
+  const doneItems = items.filter((i) => i.result?.output_path)
+
+  const revealOutput = useCallback(() => {
+    const target =
+      (selected?.result?.output_path && selected.result.output_path) ||
+      doneItems[doneItems.length - 1]?.result.output_path ||
+      health?.default_output_dir
+    if (target) reveal(target)
+  }, [selected, doneItems, health, reveal])
+
+  const save = useCallback(
+    async (url, filename) => {
+      try {
+        const result = await downloadUrl(url, filename)
+        if (result?.path) toast('Saved', { type: 'success', detail: result.path })
+      } catch (e) {
+        toast("Couldn't save the file", { type: 'error', detail: e.message })
+      }
+    },
+    [toast],
+  )
+
+  // ── presets & settings files ─────────────────────────────────────────
+  const onApplyPreset = useCallback(
+    (preset) => {
+      setSettings((current) => applyPreset(preset, current))
+      setActivePresetId(preset.id)
+      setSettingsError(null)
+      toast(`Applied “${preset.name}”`)
+    },
+    [toast],
+  )
+
+  const onSavePreset = useCallback(async () => {
+    const values = await prompt({
+      title: 'Save preset',
+      message: 'Saves every setting, including output folder and naming.',
+      confirmLabel: 'Save preset',
+      fields: [
+        { name: 'name', label: 'Name', required: true, maxLength: 60, placeholder: 'e.g. Blog images' },
+        { name: 'description', label: 'Description (optional)', maxLength: 200, placeholder: 'What it’s for' },
+      ],
+    })
+    if (!values) return
+    try {
+      const { preset } = await api.savePreset({ name: values.name.trim(), description: values.description, settings })
+      await loadPresets()
+      setActivePresetId(preset.id)
+      toast(`Saved preset “${preset.name}”`, { type: 'success' })
+    } catch (e) {
+      toast("Couldn't save the preset", { type: 'error', detail: e.message })
+    }
+  }, [prompt, settings, loadPresets, toast])
+
+  const onDeletePreset = useCallback(
+    async (preset) => {
+      if (!(await confirm({ title: `Delete “${preset.name}”?`, confirmLabel: 'Delete', danger: true }))) return
+      try {
+        await api.deletePreset(preset.id)
+        if (activePresetId === preset.id) setActivePresetId(null)
+        await loadPresets()
+      } catch (e) {
+        toast("Couldn't delete the preset", { type: 'error', detail: e.message })
+      }
+    },
+    [confirm, activePresetId, loadPresets, toast],
+  )
+
+  const onExportSettings = useCallback(async () => {
+    const { blob, filename } = exportSettingsFile(settings)
+    try {
+      await downloadBlob(blob, filename)
+    } catch (e) {
+      toast("Couldn't export settings", { type: 'error', detail: e.message })
+    }
+  }, [settings, toast])
+
+  const onResetSettings = useCallback(async () => {
+    if (!(await confirm({ title: 'Reset all settings?', message: 'Restores the defaults. Saved presets are kept.', confirmLabel: 'Reset' }))) return
+    setSettings({ ...DEFAULT_SETTINGS })
+    setActivePresetId(null)
+    setSettingsError(null)
+  }, [confirm])
+
+  const showShortcuts = useCallback(() => {
+    confirm({
+      title: 'Keyboard shortcuts',
+      cancelLabel: null,
+      confirmLabel: 'Done',
+      message: (
+        <dl className="shortcuts">
+          {SHORTCUTS.map(([keys, label]) => (
+            <div key={keys}>
+              <dt>
+                <kbd>{keys}</kbd>
+              </dt>
+              <dd>{label}</dd>
+            </div>
+          ))}
+        </dl>
+      ),
+    })
+  }, [confirm])
+
+  const pickOutput = useCallback(async () => {
+    try {
+      const paths = await pickPaths('output', health)
+      if (paths?.length) update('output_dir', paths[0])
+    } catch (e) {
+      toast("Couldn't open the folder picker", { type: 'error', detail: e.message })
+    }
+  }, [health, update, toast])
+
+  // ── global input: drop, paste, keys ──────────────────────────────────
+  actions.current = { addFiles, addPaths, onAddFiles, onAddFolder, process, cancel, removeItem, showShortcuts, running, selectedId, items, filter }
+
+  useEffect(() => {
+    let depth = 0
+    const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files')
+    const enter = (e) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      depth += 1
+      setDragging(true)
+    }
+    const over = (e) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    }
+    const leave = (e) => {
+      if (!hasFiles(e)) return
+      depth = Math.max(0, depth - 1)
+      if (!depth) setDragging(false)
+    }
+    const drop = (e) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      depth = 0
+      setDragging(false)
+      const files = filesFromDrop(e.dataTransfer).catch(() => [...(e.dataTransfer.files || [])])
+      nativeDropPaths().then((paths) =>
+        paths ? actions.current.addPaths(paths) : files.then((list) => actions.current.addFiles(list)),
+      )
+    }
+    const paste = (e) => {
+      if (isTyping(e.target)) return
+      const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'))
+      if (!files.length) return
+      e.preventDefault()
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      actions.current.addFiles(
+        files.map((f, i) =>
+          isAcceptedFile(f.name) && f.name !== 'image.png' ? f : new File([f], `pasted-${stamp}${i ? `-${i}` : ''}.${f.type.split('/')[1] || 'png'}`, { type: f.type }),
+        ),
+      )
+    }
+    window.addEventListener('dragenter', enter)
+    window.addEventListener('dragover', over)
+    window.addEventListener('dragleave', leave)
+    window.addEventListener('drop', drop)
+    window.addEventListener('paste', paste)
+    return () => {
+      window.removeEventListener('dragenter', enter)
+      window.removeEventListener('dragover', over)
+      window.removeEventListener('dragleave', leave)
+      window.removeEventListener('drop', drop)
+      window.removeEventListener('paste', paste)
+    }
   }, [])
 
   useEffect(() => {
-    fetchHealth().then(setHealth)
-    fetchPresets().then((d) => setPresets(d.presets || []))
-    refreshQueue()
-  }, [refreshQueue])
-
-  useEffect(() => {
-    saveSettingsToStorage(settings)
-  }, [settings])
-
-  useEffect(() => {
-    if (progress?.running) {
-      pollRef.current = setInterval(async () => {
-        const st = await fetchProcessStatus()
-        setProgress(st)
-        await refreshQueue()
-        if (!st.running) {
-          clearInterval(pollRef.current)
-          setToast(
-            `${st.completed} images processed in ${st.elapsed_seconds}s — saved ${st.mb_saved} MB`,
-          )
-          setTimeout(() => setToast(null), 6000)
-        }
-      }, 400)
-      return () => clearInterval(pollRef.current)
-    }
-  }, [progress?.running, refreshQueue])
-
-  const updateSetting = (key, value) => {
-    setSettings((s) => ({ ...s, [key]: value }))
-  }
-
-  const handleFiles = async (fileList) => {
-    const files = Array.from(fileList)
-    if (!files.length) return
-    if (files.length > 500 && !window.confirm(`Process ${files.length} files? This may take a while.`)) {
-      return
-    }
-    try {
-      await uploadFiles(files)
-      await refreshQueue()
-    } catch (e) {
-      alert('Upload failed: ' + e.message)
-    }
-  }
-
-  const onDrop = async (e) => {
-    e.preventDefault()
-    setDragOver(false)
-    const items = e.dataTransfer.items
-    const files = []
-    const paths = []
-
-    if (items) {
-      for (const item of items) {
-        if (item.kind === 'file') {
-          const entry = item.webkitGetAsEntry?.()
-          if (entry?.isDirectory) {
-            alert('Folder drop: use file picker or drag individual files. For local paths, use Settings → Add folder path.')
-            continue
-          }
-          const f = item.getAsFile()
-          if (f) files.push(f)
-        }
+    const down = (e) => {
+      const a = actions.current
+      if (document.querySelector('.modal-backdrop')) return
+      const mod = e.metaKey || e.ctrlKey
+      const key = e.key.toLowerCase()
+      if (mod && key === 'o') {
+        e.preventDefault()
+        if (e.shiftKey) a.onAddFolder()
+        else a.onAddFiles()
+        return
       }
-    } else {
-      files.push(...Array.from(e.dataTransfer.files))
+      if (mod && e.key === 'Enter') {
+        e.preventDefault()
+        a.process()
+        return
+      }
+      if (isTyping(e.target) || mod) return
+      if (e.key === 'Escape' && a.running) {
+        a.cancel()
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        const visible = filterItems(a.items, a.filter)
+        if (!visible.length) return
+        const index = visible.findIndex((i) => i.id === a.selectedId)
+        const next = e.key === 'ArrowDown' ? Math.min(visible.length - 1, index + 1) : Math.max(0, index - 1)
+        setSelectedId(visible[index < 0 ? 0 : next].id)
+      } else if ((e.key === 'Backspace' || e.key === 'Delete') && a.selectedId) {
+        a.removeItem(a.selectedId)
+      } else if (e.key === ' ' && !isControl(e.target)) {
+        if (!e.repeat) setHoldOriginal(true)
+      } else if (e.key === '?') {
+        a.showShortcuts()
+      } else {
+        return
+      }
+      e.preventDefault()
     }
-
-    if (files.length) await handleFiles(files)
-    if (paths.length) {
-      await addPaths(paths)
-      await refreshQueue()
+    const up = (e) => e.key === ' ' && setHoldOriginal(false)
+    const blur = () => setHoldOriginal(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', blur)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+      window.removeEventListener('blur', blur)
     }
-  }
+  }, [])
 
-  const applyPreset = (preset) => {
-    setSettings((s) => ({ ...s, ...preset.settings }))
-    setPresetOpen(false)
-  }
-
-  const runProcess = async () => {
-    if (!queue.count) return
-    if (settings.overwrite && !window.confirm('Overwrite existing files? Originals may be replaced.')) {
-      return
-    }
-    try {
-      const result = await startProcess(settings)
-      setProgress(result.progress)
-    } catch (e) {
-      alert('Failed to start: ' + e.message)
-    }
-  }
-
-  const runPreview = async () => {
-    const item = queue.items.find((i) => i.id === selectedId) || queue.items[0]
-    if (!item) return
-    setPreviewLoading(true)
-    try {
-      const data = await previewImage(item.path, settings)
-      setPreview(data)
-    } catch (e) {
-      alert('Preview failed: ' + e.message)
-    } finally {
-      setPreviewLoading(false)
-    }
-  }
-
-  const saveCurrentPreset = async () => {
-    const name = window.prompt('Preset name:')
-    if (!name) return
-    const id = name.toLowerCase().replace(/\s+/g, '-')
-    await savePreset({ id, name, description: 'Custom preset', settings })
-    const d = await fetchPresets()
-    setPresets(d.presets || [])
-  }
-
-  const totalSaved = queue.items.reduce((acc, i) => {
-    if (i.result) return acc + Math.max(0, i.original_size - i.result.new_size)
-    return acc
-  }, 0)
+  const revealLabel = isApp || health?.platform === 'darwin' ? 'Show in Finder' : 'Open folder'
 
   return (
     <div className="app">
-      {showTip && health && !health.jpegtran_available && (
-        <div className="tip-banner">
-          <span>
-            Install <code>jpegtran</code> for lossless JPEG optimization:{' '}
-            <code>brew install jpeg</code>
-          </span>
-          <button
-            onClick={() => {
-              localStorage.setItem('tip-dismissed', '1')
-              setShowTip(false)
-            }}
-          >
-            ×
-          </button>
+      <TopBar
+        health={health}
+        presets={presets}
+        activePresetId={activePresetId}
+        onApplyPreset={onApplyPreset}
+        onSavePreset={onSavePreset}
+        onDeletePreset={onDeletePreset}
+        onImportSettings={() => importInput.current?.click()}
+        onExportSettings={onExportSettings}
+        onResetSettings={onResetSettings}
+        theme={theme}
+        setTheme={setTheme}
+        onShowShortcuts={showShortcuts}
+        isApp={isApp}
+      />
+
+      <div className="workspace">
+        <QueuePanel
+          items={items}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          filter={filter}
+          setFilter={setFilter}
+          onRemove={removeItem}
+          onReveal={reveal}
+          onDownload={(item) => save(urls.output(item.id, true), basename(item.result.output_path))}
+          onAddFiles={onAddFiles}
+          onAddFolder={onAddFolder}
+          onClear={clearQueue}
+          onRetryFailed={retryFailed}
+          running={running}
+          upload={upload}
+        />
+        <PreviewPanel
+          item={selected}
+          hasItems={items.length > 0}
+          preview={preview}
+          settings={settings}
+          holdOriginal={holdOriginal}
+          onRetry={() => setPreviewNonce((n) => n + 1)}
+          onAddFiles={onAddFiles}
+          onAddFolder={onAddFolder}
+          onReveal={reveal}
+          onFocusField={focusField}
+          health={health}
+        />
+        <SettingsPanel
+          settings={settings}
+          update={update}
+          health={health}
+          error={settingsError}
+          exampleFile={selected?.filename}
+          onPickOutput={pickOutput}
+          onRevealOutput={revealOutput}
+          isApp={isApp}
+        />
+      </div>
+
+      <ActionBar
+        status={status}
+        showSummary={showSummary}
+        onDismissSummary={() => setShowSummary(false)}
+        count={items.length}
+        doneCount={doneItems.length}
+        onProcess={() => process()}
+        onCancel={cancel}
+        onZip={() => save(urls.zip(), isApp ? 'Image Lab export.zip' : undefined)}
+        onCsv={() => save(urls.csv, isApp ? 'Image Lab report.csv' : undefined)}
+        onRevealOutput={revealOutput}
+        onRetryFailed={retryFailed}
+        revealLabel={revealLabel}
+      />
+
+      <input
+        ref={fileInput}
+        type="file"
+        multiple
+        hidden
+        accept={['image/*', ...ACCEPTED_EXTENSIONS].join(',')}
+        onChange={(e) => {
+          addFiles(e.target.files)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={folderInput}
+        type="file"
+        hidden
+        webkitdirectory=""
+        directory=""
+        multiple
+        onChange={(e) => {
+          addFiles(e.target.files)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={importInput}
+        type="file"
+        hidden
+        accept=".json,application/json"
+        onChange={async (e) => {
+          const file = e.target.files?.[0]
+          e.target.value = ''
+          if (!file) return
+          try {
+            setSettings(await readSettingsFile(file))
+            setActivePresetId(null)
+            toast('Settings imported', { type: 'success' })
+          } catch {
+            toast("That file isn't an Image Lab settings file", { type: 'error' })
+          }
+        }}
+      />
+
+      {dragging && (
+        <div className="drop-overlay">
+          <div className="drop-card">
+            <Icon name="upload" size={28} />
+            <div className="drop-title">Drop to add images</div>
+            <div className="muted">Files and folders · {ACCEPTED_EXTENSIONS.length} formats</div>
+          </div>
         </div>
       )}
 
-      <header className="header">
-        <div className="header-left">
-          <h1>Image Lab</h1>
-          <span className="subtitle">Local batch processor</span>
+      {engineDown && (
+        <div className="engine-down" role="alert">
+          <div className="engine-card">
+            <span className="spinner" style={{ width: 22, height: 22 }} />
+            <h2>Connecting to the Image Lab engine…</h2>
+            <p className="muted">
+              {isApp ? 'This usually takes a second.' : 'Make sure the backend is running (./start.sh). Retrying automatically.'}
+            </p>
+          </div>
         </div>
-        <div className="header-actions">
-          <div className="preset-dropdown">
-            <button onClick={() => setPresetOpen(!presetOpen)}>Presets ▾</button>
-            {presetOpen && (
-              <div className="preset-menu panel">
-                {presets.map((p) => (
-                  <button key={p.id} className="preset-item" onClick={() => applyPreset(p)}>
-                    <strong>{p.name}</strong>
-                    <small>{p.description}</small>
-                  </button>
-                ))}
-                <button className="preset-item" onClick={saveCurrentPreset}>
-                  + Save current as preset
-                </button>
-              </div>
-            )}
-          </div>
-          <button onClick={() => exportSettings(settings)}>Export settings</button>
-          <button
-            onClick={() => {
-              const input = document.createElement('input')
-              input.type = 'file'
-              input.accept = '.json'
-              input.onchange = async (e) => {
-                const f = e.target.files[0]
-                if (f) setSettings(await importSettings(f))
-              }
-              input.click()
-            }}
-          >
-            Import settings
-          </button>
-        </div>
-      </header>
-
-      <main className="layout">
-        <aside className="sidebar panel">
-          <div
-            className={`drop-zone ${dragOver ? 'drag-over' : ''}`}
-            onDragOver={(e) => {
-              e.preventDefault()
-              setDragOver(true)
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept="image/*,.heic,.heif"
-              hidden
-              onChange={(e) => handleFiles(e.target.files)}
-            />
-            <div className="drop-icon">⬇</div>
-            <p>Drop files or folders</p>
-            <small>JPEG · PNG · WEBP · GIF · HEIC</small>
-          </div>
-
-          <div className="queue-stats">
-            <span>{queue.count} images</span>
-            <span>{formatBytes(queue.total_size)}</span>
-            {totalSaved > 0 && <span className="saved">−{formatBytes(totalSaved)} saved</span>}
-          </div>
-
-          <div className="queue-list">
-            {queue.items.map((item) => (
-              <div
-                key={item.id}
-                className={`queue-item ${selectedId === item.id ? 'selected' : ''}`}
-                onClick={() => setSelectedId(item.id)}
-              >
-                {item.thumbnail ? (
-                  <img src={`data:image/jpeg;base64,${item.thumbnail}`} alt="" className="thumb" />
-                ) : (
-                  <div className="thumb placeholder" />
-                )}
-                <div className="queue-meta">
-                  <div className="filename" title={item.filename}>
-                    {item.filename}
-                  </div>
-                  <div className="meta-row">
-                    <span>{item.width}×{item.height}</span>
-                    <span>{formatBytes(item.original_size)}</span>
-                    <StatusBadge status={item.status} />
-                  </div>
-                  {item.result && (
-                    <div className="result-row">
-                      → {formatBytes(item.result.new_size)}
-                      {item.result.savings_percent > 0 && (
-                        <span className="savings"> (−{item.result.savings_percent}%)</span>
-                      )}
-                      {item.result.method_used && (
-                        <span className="method"> {item.result.method_used}</span>
-                      )}
-                    </div>
-                  )}
-                  {item.error && <div className="error-text">{item.error}</div>}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {progress && (
-            <div className="progress-bar panel">
-              {progress.running ? (
-                <>
-                  <div className="progress-text">
-                    {progress.completed}/{progress.total} done · {progress.files_per_second} files/sec
-                    · saved {progress.mb_saved} MB · ETA {progress.eta_seconds}s
-                  </div>
-                  {progress.current_file && (
-                    <div className="current-file">Processing: {progress.current_file}</div>
-                  )}
-                </>
-              ) : progress.completed > 0 ? (
-                <div className="progress-text done">
-                  Done — {progress.completed} files in {progress.elapsed_seconds}s
-                </div>
-              ) : null}
-            </div>
-          )}
-        </aside>
-
-        <section className="workspace">
-          <div className="operations panel">
-            <h3>Operations</h3>
-            <div className="op-toggles">
-              {[
-                ['compress_enabled', 'Compress'],
-                ['resize_enabled', 'Resize'],
-                ['upscale_enabled', 'Upscale'],
-                ['convert_enabled', 'Convert'],
-                ['strip_exif', 'Strip EXIF'],
-                ['trim_transparent', 'Trim transparent'],
-                ['auto_rotate', 'Auto-rotate'],
-                ['keep_icc', 'Keep ICC'],
-              ].map(([key, label]) => (
-                <label key={key}>
-                  <input
-                    type="checkbox"
-                    checked={!!settings[key]}
-                    onChange={(e) => updateSetting(key, e.target.checked)}
-                  />
-                  {label}
-                </label>
-              ))}
-            </div>
-          </div>
-
-          {settings.compress_enabled && (
-            <div className="settings-section panel">
-              <h3>Compress</h3>
-              <div className="field-row">
-                <div className="field">
-                  <span>Mode</span>
-                  <select
-                    value={settings.compress_mode}
-                    onChange={(e) => updateSetting('compress_mode', e.target.value)}
-                  >
-                    <option value="target_size">Target max size</option>
-                    <option value="quality">Target quality</option>
-                    <option value="lossless_first">Lossless first</option>
-                  </select>
-                </div>
-                {settings.compress_mode === 'target_size' && (
-                  <div className="field">
-                    <span>Max size (MB)</span>
-                    <input
-                      type="number"
-                      min="0.1"
-                      step="0.1"
-                      value={settings.target_size_mb}
-                      onChange={(e) => updateSetting('target_size_mb', parseFloat(e.target.value))}
-                    />
-                  </div>
-                )}
-                {settings.compress_mode !== 'target_size' && (
-                  <div className="field">
-                    <span>Quality</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="100"
-                      value={settings.quality}
-                      onChange={(e) => updateSetting('quality', parseInt(e.target.value, 10))}
-                    />
-                  </div>
-                )}
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={settings.lossless_first}
-                    onChange={(e) => updateSetting('lossless_first', e.target.checked)}
-                  />
-                  jpegtran first
-                </label>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={settings.progressive}
-                    onChange={(e) => updateSetting('progressive', e.target.checked)}
-                  />
-                  Progressive
-                </label>
-                <div className="field">
-                  <span>Subsampling</span>
-                  <select
-                    value={settings.subsampling}
-                    onChange={(e) => updateSetting('subsampling', parseInt(e.target.value, 10))}
-                  >
-                    <option value={0}>0 (4:4:4 best)</option>
-                    <option value={1}>1</option>
-                    <option value={2}>2 (default)</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {settings.resize_enabled && (
-            <div className="settings-section panel">
-              <h3>Resize</h3>
-              <div className="field-row">
-                <div className="field">
-                  <span>Max width</span>
-                  <input
-                    type="number"
-                    placeholder="—"
-                    value={settings.max_width ?? ''}
-                    onChange={(e) =>
-                      updateSetting('max_width', e.target.value ? parseInt(e.target.value, 10) : null)
-                    }
-                  />
-                </div>
-                <div className="field">
-                  <span>Max height</span>
-                  <input
-                    type="number"
-                    placeholder="—"
-                    value={settings.max_height ?? ''}
-                    onChange={(e) =>
-                      updateSetting('max_height', e.target.value ? parseInt(e.target.value, 10) : null)
-                    }
-                  />
-                </div>
-                <div className="field">
-                  <span>Exact W×H</span>
-                  <div style={{ display: 'flex', gap: 4 }}>
-                    <input
-                      type="number"
-                      placeholder="W"
-                      value={settings.exact_width ?? ''}
-                      onChange={(e) =>
-                        updateSetting('exact_width', e.target.value ? parseInt(e.target.value, 10) : null)
-                      }
-                    />
-                    <input
-                      type="number"
-                      placeholder="H"
-                      value={settings.exact_height ?? ''}
-                      onChange={(e) =>
-                        updateSetting('exact_height', e.target.value ? parseInt(e.target.value, 10) : null)
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="field">
-                  <span>Fit mode</span>
-                  <select
-                    value={settings.fit_mode}
-                    onChange={(e) => updateSetting('fit_mode', e.target.value)}
-                  >
-                    <option value="contain">Contain</option>
-                    <option value="cover">Cover</option>
-                    <option value="crop_center">Crop center</option>
-                  </select>
-                </div>
-                <div className="field">
-                  <span>Scale %</span>
-                  <input
-                    type="number"
-                    placeholder="—"
-                    value={settings.scale_percent ?? ''}
-                    onChange={(e) =>
-                      updateSetting('scale_percent', e.target.value ? parseFloat(e.target.value) : null)
-                    }
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {settings.upscale_enabled && (
-            <div className="settings-section panel">
-              <h3>Upscale</h3>
-              <p className="warning-text">
-                Standard upscale uses Lanczos interpolation — it cannot create detail that is not in the
-                original.
-              </p>
-              <div className="field-row">
-                <div className="field">
-                  <span>Scale factor</span>
-                  <input
-                    type="number"
-                    min="1.1"
-                    step="0.5"
-                    value={settings.upscale_factor}
-                    onChange={(e) => updateSetting('upscale_factor', parseFloat(e.target.value))}
-                  />
-                </div>
-                <div className="field">
-                  <span>Method</span>
-                  <select
-                    value={settings.upscale_method}
-                    onChange={(e) => updateSetting('upscale_method', e.target.value)}
-                  >
-                    <option value="standard">Standard (Lanczos)</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {(settings.convert_enabled || settings.compress_enabled) && (
-            <div className="settings-section panel">
-              <h3>Output format</h3>
-              <div className="field-row">
-                <div className="field">
-                  <span>Format</span>
-                  <select
-                    value={settings.output_format}
-                    onChange={(e) => updateSetting('output_format', e.target.value)}
-                  >
-                    <option value="keep">Keep original</option>
-                    <option value="JPEG">JPEG</option>
-                    <option value="PNG">PNG</option>
-                    <option value="WEBP">WEBP</option>
-                    <option value="AVIF">AVIF</option>
-                  </select>
-                </div>
-                {settings.convert_enabled && settings.output_format === 'JPEG' && (
-                  <div className="field" title="Fill color for transparent areas when converting PNG/WEBP/GIF to JPEG">
-                    <span>Transparency fill</span>
-                    <input
-                      type="text"
-                      value={settings.bg_color}
-                      onChange={(e) => updateSetting('bg_color', e.target.value)}
-                      placeholder="#ffffff"
-                    />
-                  </div>
-                )}
-                <div className="field">
-                  <span>Output folder</span>
-                  <input
-                    type="text"
-                    placeholder="processed/ (default)"
-                    value={settings.output_dir}
-                    onChange={(e) => updateSetting('output_dir', e.target.value)}
-                  />
-                </div>
-                <div className="field">
-                  <span>Suffix</span>
-                  <input
-                    type="text"
-                    value={settings.naming_suffix}
-                    onChange={(e) => updateSetting('naming_suffix', e.target.value)}
-                  />
-                </div>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={settings.overwrite}
-                    onChange={(e) => updateSetting('overwrite', e.target.checked)}
-                  />
-                  Overwrite
-                </label>
-              </div>
-            </div>
-          )}
-
-          <div className="preview-section panel">
-            <div className="preview-header">
-              <h3>Preview</h3>
-              <button onClick={runPreview} disabled={!queue.count || previewLoading}>
-                {previewLoading ? 'Processing…' : 'Preview selected'}
-              </button>
-            </div>
-            {preview && (
-              <div className="preview-grid">
-                <div className="preview-pane">
-                  <div className="preview-label">Before · {formatBytes(preview.original_size)} · {preview.original_dimensions?.join('×')}</div>
-                  {preview.before && (
-                    <img src={`data:image/jpeg;base64,${preview.before}`} alt="Before" />
-                  )}
-                </div>
-                <div className="preview-pane">
-                  <div className="preview-label">
-                    After · {formatBytes(preview.new_size)} · {preview.new_dimensions?.join('×')}
-                    {preview.quality_used != null && ` · q${preview.quality_used}`}
-                    {preview.method_used && ` · ${preview.method_used}`}
-                    {preview.processing_time_ms != null && ` · ${preview.processing_time_ms.toFixed(0)}ms`}
-                  </div>
-                  {preview.after && (
-                    <img
-                      src={`data:image/${preview.after_format || 'jpeg'};base64,${preview.after}`}
-                      alt="After"
-                    />
-                  )}
-                </div>
-              </div>
-            )}
-            {!preview && <p className="muted">Select a file and click Preview to compare before/after.</p>}
-          </div>
-
-          <div className="actions-bar">
-            {progress?.running ? (
-              <button className="danger" onClick={cancelProcess}>
-                Cancel
-              </button>
-            ) : (
-              <button className="primary" onClick={runProcess} disabled={!queue.count}>
-                ▶ Process All ({queue.count})
-              </button>
-            )}
-            <button
-              onClick={async () => {
-                await clearQueue()
-                await refreshQueue()
-                setPreview(null)
-              }}
-              disabled={progress?.running || !queue.count}
-            >
-              Clear
-            </button>
-            <a href="/api/export/zip" className="btn-link" onClick={(e) => !queue.count && e.preventDefault()}>
-              Download ZIP
-            </a>
-            <a href="/api/report?format=csv" className="btn-link">
-              Export CSV
-            </a>
-          </div>
-
-          {health && (
-            <div className="health-footer">
-              Pillow {health.pillow_version} · jpegtran {health.jpegtran_available ? '✓' : '✗'} · HEIC{' '}
-              {health.heif_available ? '✓' : '✗'} · {health.cpu_count} threads
-            </div>
-          )}
-        </section>
-      </main>
-
-      {toast && <div className="toast">{toast}</div>}
+      )}
     </div>
   )
 }

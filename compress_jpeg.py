@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI JPEG compressor — target max file size with lossless jpegtran first."""
+"""CLI: compress images to a target max size — same engine as the app."""
 
 from __future__ import annotations
 
@@ -7,44 +7,65 @@ import argparse
 import sys
 from pathlib import Path
 
-# Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
-from processor.pipeline import ProcessingSettings, process_image
+from processor.pipeline import (  # noqa: E402
+    ProcessingSettings,
+    SettingsError,
+    discover_images,
+    format_bytes,
+    process_image,
+)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compress JPEG to target max size")
-    parser.add_argument("input", type=Path, help="Input JPEG file")
-    parser.add_argument("-o", "--output", type=Path, help="Output path")
+    parser = argparse.ArgumentParser(description="Compress images to a target max size (lossless first)")
+    parser.add_argument("inputs", nargs="+", type=Path, help="Image files or folders")
+    parser.add_argument("-o", "--output", type=Path, help="Output file (single input) or folder")
     parser.add_argument("-m", "--max-mb", type=float, default=12.0, help="Max size in MB (default: 12)")
+    parser.add_argument("-q", "--max-quality", type=int, default=95, help="Highest JPEG quality to try")
+    parser.add_argument("-f", "--format", default="keep", help="keep | JPEG | PNG | WEBP | AVIF | TIFF")
+    parser.add_argument("--keep-metadata", action="store_true", help="Keep EXIF/GPS metadata")
     args = parser.parse_args()
 
-    if not args.input.exists():
-        print(f"Error: {args.input} not found", file=sys.stderr)
+    files = discover_images([str(p) for p in args.inputs])
+    if not files:
+        print("Error: no supported images found", file=sys.stderr)
         return 1
 
-    settings = ProcessingSettings(
-        compress_enabled=True,
-        compress_mode="target_size",
-        target_size_mb=args.max_mb,
-        lossless_first=True,
-        strip_exif=True,
-        output_dir=str(args.output.parent) if args.output else None,
-        naming_suffix="" if args.output else "_compressed",
-    )
+    single_output = args.output if args.output and len(files) == 1 and args.output.suffix else None
+    try:
+        settings = ProcessingSettings.from_dict(
+            {
+                "compress_mode": "target_size",
+                "target_size": args.max_mb,
+                "target_unit": "MB",
+                "quality": args.max_quality,
+                "output_format": args.format,
+                "strip_metadata": not args.keep_metadata,
+                "output_dir": str(args.output) if args.output and not single_output else None,
+                "naming_suffix": "_compressed",
+            }
+        )
+    except SettingsError as exc:
+        print(f"Error: {exc.message}", file=sys.stderr)
+        return 2
 
-    result = process_image(args.input, settings, output_path=args.output)
-    if not result.success:
-        print(f"Error: {result.error}", file=sys.stderr)
-        return 1
-
-    orig_mb = result.original_size / (1024 * 1024)
-    new_mb = result.new_size / (1024 * 1024)
-    print(f"{args.input.name}: {orig_mb:.2f} MB → {new_mb:.2f} MB ({result.method_used})")
-    if result.output_path:
-        print(f"Saved: {result.output_path}")
-    return 0
+    failures = 0
+    for path in files:
+        result = process_image(path, settings, output_path=single_output)
+        if not result.success:
+            failures += 1
+            print(f"✗ {path.name}: {result.error}", file=sys.stderr)
+            continue
+        detail = result.method_used + (f" q{result.quality_used}" if result.quality_used else "")
+        print(
+            f"✓ {path.name}: {format_bytes(result.original_size)} → {format_bytes(result.new_size)} "
+            f"({detail}) → {result.output_path}"
+        )
+        for warning in result.warnings:
+            print(f"  ! {warning}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

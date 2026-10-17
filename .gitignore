@@ -1,9 +1,15 @@
 .venv/
+.venv-build/
 __pycache__/
 *.pyc
+.pytest_cache/
 uploads/
+data/
 test_images/
 node_modules/
 frontend/dist/
 presets/custom.json
+build/
+dist/
+*.dmg
 .DS_Store

@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Dev mode: backend + Vite hot reload
+# Dev mode: backend with auto-reload + Vite hot reload on :5173 (proxies /api).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VENV="$ROOT/.venv"
 PORT="${PORT:-8765}"
 
-source "$VENV/bin/activate" 2>/dev/null || {
+if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
-  source "$VENV/bin/activate"
-  pip install -q -r "$ROOT/backend/requirements.txt"
-}
+fi
+"$VENV/bin/python" -m pip install -q -r "$ROOT/backend/requirements-dev.txt"
+[ -d "$ROOT/frontend/node_modules" ] || (cd "$ROOT/frontend" && npm install --no-fund --no-audit)
 
-(cd "$ROOT/frontend" && npm install --silent 2>/dev/null; npm run dev) &
-FRONTEND_PID=$!
+pids=()
+cleanup() { kill "${pids[@]}" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
 
-cd "$ROOT/backend"
-uvicorn main:app --host 127.0.0.1 --port "$PORT" --reload &
-BACKEND_PID=$!
+(cd "$ROOT/backend" && exec "$VENV/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "$PORT" --reload) &
+pids+=($!)
+(cd "$ROOT/frontend" && exec npm run dev) &
+pids+=($!)
 
-trap "kill $FRONTEND_PID $BACKEND_PID 2>/dev/null" EXIT
-
-echo "Dev servers running:"
-echo "  Frontend: http://127.0.0.1:5173"
-echo "  Backend:  http://127.0.0.1:$PORT"
+echo "Dev servers:"
+echo "  UI (hot reload): http://127.0.0.1:5173"
+echo "  API:             http://127.0.0.1:$PORT"
 wait
